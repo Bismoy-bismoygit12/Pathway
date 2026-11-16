@@ -1,12 +1,73 @@
-import { User, TrustedContact, DoctorAccess, Session } from '../types';
+import { User, TrustedContact, DoctorAccess } from '../types';
 import { getAllUsersData, saveAllUsersData, mockHashPassword } from './auth';
+import {
+  isRealUserId,
+  saveUserUpdates,
+  insertTrustedContact,
+  deleteTrustedContact,
+  upsertDoctorAccess,
+} from './supabaseUser';
+import { changePasswordWithCurrent, signOutOtherDevices } from './supabaseAuth';
+
+/*
+ * Two kinds of accounts live side by side:
+ *   - real accounts (UUID ids) are stored in Supabase;
+ *   - the old demo personas (ids like "user-shanto") stay in localStorage so the
+ *     demo drawer keeps working.
+ * Every function below keeps its original signature, so pages did not need to change.
+ * For real accounts the change is applied to an in-memory copy right away (the screen
+ * updates instantly) and saved to Supabase in the background.
+ */
+
+let cachedUser: User | null = null;
+
+/** AuthContext keeps this in step with the signed-in person. */
+export function setUserCache(user: User | null) {
+  cachedUser = user;
+}
+
+const pendingWrites = new Set<Promise<void>>();
+
+function track(task: Promise<unknown>, what: string) {
+  const done: Promise<void> = task
+    .then(
+      () => undefined,
+      (err) => {
+        console.error(`Pathway: could not save ${what}`, err);
+      }
+    )
+    .then(() => {
+      pendingWrites.delete(done);
+    });
+  pendingWrites.add(done);
+}
+
+/** Wait until background saves finish (so a refresh never reads stale data). */
+export async function waitForPendingWrites(): Promise<void> {
+  while (pendingWrites.size > 0) {
+    await Promise.all([...pendingWrites]);
+  }
+}
+
+function cachedFor(userId: string): User | null {
+  return cachedUser && cachedUser.id === userId ? cachedUser : null;
+}
 
 export function getUserById(userId: string): User | null {
+  if (isRealUserId(userId)) return cachedFor(userId);
   const all = getAllUsersData();
   return all[userId]?.user || null;
 }
 
 export function updateUser(userId: string, updates: Partial<User>): User | null {
+  if (isRealUserId(userId)) {
+    const current = cachedFor(userId);
+    if (!current) return null;
+    cachedUser = { ...current, ...updates };
+    track(saveUserUpdates(userId, updates), 'your changes');
+    return cachedUser;
+  }
+
   const all = getAllUsersData();
   if (!all[userId]) return null;
 
@@ -18,7 +79,15 @@ export function updateUser(userId: string, updates: Partial<User>): User | null 
   return all[userId].user;
 }
 
-export function changeUserPassword(userId: string, currentPw: string, newPw: string): { success: boolean; error?: string } {
+export async function changeUserPassword(
+  userId: string,
+  currentPw: string,
+  newPw: string
+): Promise<{ success: boolean; error?: string }> {
+  if (isRealUserId(userId)) {
+    return changePasswordWithCurrent(currentPw, newPw);
+  }
+
   const all = getAllUsersData();
   if (!all[userId]) return { success: false, error: 'User not found' };
 
@@ -36,6 +105,13 @@ export function addTrustedContact(userId: string, contact: Omit<TrustedContact, 
   const user = getUserById(userId);
   if (!user) return null;
 
+  if (isRealUserId(userId)) {
+    const newContact: TrustedContact = { ...contact, id: crypto.randomUUID() };
+    cachedUser = { ...user, trustedContacts: [...user.trustedContacts, newContact] };
+    track(insertTrustedContact(userId, newContact), 'your trusted contact');
+    return cachedUser;
+  }
+
   const newContact: TrustedContact = {
     ...contact,
     id: `tc-${Date.now()}`
@@ -49,6 +125,13 @@ export function removeTrustedContact(userId: string, contactId: string): User | 
   const user = getUserById(userId);
   if (!user) return null;
   const filtered = user.trustedContacts.filter((c) => c.id !== contactId);
+
+  if (isRealUserId(userId)) {
+    cachedUser = { ...user, trustedContacts: filtered };
+    track(deleteTrustedContact(userId, contactId), 'the removal of your trusted contact');
+    return cachedUser;
+  }
+
   return updateUser(userId, { trustedContacts: filtered });
 }
 
@@ -66,6 +149,12 @@ export function updateDoctorAccess(userId: string, doctorAccess: DoctorAccess): 
     updatedList.push(doctorAccess);
   }
 
+  if (isRealUserId(userId)) {
+    cachedUser = { ...user, doctorAccessList: updatedList };
+    track(upsertDoctorAccess(userId, doctorAccess), 'your doctor sharing settings');
+    return cachedUser;
+  }
+
   return updateUser(userId, { doctorAccessList: updatedList });
 }
 
@@ -74,6 +163,12 @@ export function revokeSession(userId: string, sessionId: string): User | null {
   const user = getUserById(userId);
   if (!user) return null;
   const filtered = user.sessions.filter((s) => s.id !== sessionId);
+  // Supabase cannot end one named device from the browser, so real accounts only
+  // ever list "this device"; the bulk action below ends all the others.
+  if (isRealUserId(userId)) {
+    cachedUser = { ...user, sessions: filtered };
+    return cachedUser;
+  }
   return updateUser(userId, { sessions: filtered });
 }
 
@@ -81,10 +176,17 @@ export function revokeAllOtherSessions(userId: string): User | null {
   const user = getUserById(userId);
   if (!user) return null;
   const kept = user.sessions.filter((s) => s.isCurrent);
+
+  if (isRealUserId(userId)) {
+    cachedUser = { ...user, sessions: kept };
+    track(signOutOtherDevices(), 'the sign-out of your other devices');
+    return cachedUser;
+  }
+
   return updateUser(userId, { sessions: kept });
 }
 
-// Account actions: Pause
+// Account actions: Pause (real accounts call the matching server functions via updateUser)
 export function pauseAccount(userId: string): User | null {
   return updateUser(userId, { status: 'paused' });
 }

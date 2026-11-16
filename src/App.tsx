@@ -67,7 +67,16 @@ import { AccountStatusNotice } from './pages/AccountStatusNotice';
 
 // Protected Route Component
 const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { currentUser, isAuthenticated } = useAuth();
+  const { currentUser, isAuthenticated, isLoading } = useAuth();
+
+  // Wait for the saved login to be checked, otherwise a refresh would bounce people to the home page.
+  if (isLoading) {
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center text-sm text-slate-500 dark:text-slate-400">
+        Loading...
+      </div>
+    );
+  }
 
   if (!isAuthenticated || !currentUser) {
     return <Navigate to="/" replace />;
