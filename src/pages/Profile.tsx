@@ -196,7 +196,7 @@ export const Profile: React.FC = () => {
     showSuccess('Trusted contact added safely.');
   };
 
-  const handleChangePasswordSubmit = (e: React.FormEvent) => {
+  const handleChangePasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setPwError('');
     if (newPw.length < 8) {
@@ -207,7 +207,7 @@ export const Profile: React.FC = () => {
       setPwError('Passwords do not match.');
       return;
     }
-    const res = changeUserPassword(currentUser.id, currentPw, newPw);
+    const res = await changeUserPassword(currentUser.id, currentPw, newPw);
     if (res.success) {
       setCurrentPw('');
       setNewPw('');

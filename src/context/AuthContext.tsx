@@ -1,27 +1,32 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { User, UserStatus } from '../types';
+import type { Session } from '@supabase/supabase-js';
+import { User } from '../types';
 import {
   getCurrentUserId,
   setCurrentUserId,
   getAllUsersData,
   saveAllUsersData,
   isPublicComputerSession,
-  setPublicComputerSession,
-  loginUser,
-  registerUser,
-  resetUserPassword
+  setPublicComputerSession
 } from '../services/auth';
-import { updateUser } from '../services/user';
+import { updateUser, setUserCache, waitForPendingWrites } from '../services/user';
+import { supabase } from '../lib/supabase';
+import { fetchUser, isRealUserId } from '../services/supabaseUser';
+import { signInWithPassword, signUpWithPassword, RegisterParams } from '../services/supabaseAuth';
+
+export type { RegisterParams };
 
 interface AuthContextType {
   currentUser: User | null;
   user: User | null;
   isAuthenticated: boolean;
+  /** True while the saved login session is being checked on page load. */
+  isLoading: boolean;
   isPublicComputer: boolean;
   login: (identifier: string, password?: string, isOtp?: boolean, isPublic?: boolean) => Promise<{ success: boolean; error?: string; isLocked?: boolean; lockMinutes?: number }>;
   logout: () => void;
-  register: (params: Parameters<typeof registerUser>[0]) => Promise<{ success: boolean; error?: string; user?: User }>;
+  register: (params: RegisterParams) => Promise<{ success: boolean; error?: string; user?: User }>;
   refreshUser: () => void;
   updateCurrentUser: (updates: Partial<User>) => void;
   updateUser: (updates: Partial<User>) => void;
@@ -34,19 +39,85 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const navigate = useNavigate();
+
+  // Real accounts are restored asynchronously from Supabase (see the effect below).
+  // Only the old demo personas can be restored instantly from localStorage.
   const [currentUser, setCurrentUserState] = useState<User | null>(() => {
     const id = getCurrentUserId();
-    if (!id) return null;
+    if (!id || isRealUserId(id)) return null;
     const all = getAllUsersData();
     return all[id]?.user || null;
   });
+  const [isLoading, setIsLoading] = useState<boolean>(true);
 
   const [isPublic, setIsPublic] = useState<boolean>(isPublicComputerSession());
   const [sessionTimeoutWarning, setSessionTimeoutWarning] = useState<boolean>(false);
   const timeoutTimerRef = useRef<any>(null);
   const warningTimerRef = useRef<any>(null);
 
+  const currentUserRef = useRef<User | null>(currentUser);
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
+
+  /** Load the signed-in person's record from Supabase into the app. */
+  const applySession = useCallback(async (session: Session | null): Promise<User | null> => {
+    if (!session) return null;
+    await waitForPendingWrites(); // never read while a save is still on its way
+    const loaded = await fetchUser(session.user);
+    if (!loaded) return null;
+    setUserCache(loaded);
+    setCurrentUserState(loaded);
+    setCurrentUserId(null); // forget any demo persona
+    return loaded;
+  }, []);
+
+  // Restore the session on page load and follow sign-in / sign-out events.
+  useEffect(() => {
+    let cancelled = false;
+
+    supabase.auth
+      .getSession()
+      .then(async ({ data }) => {
+        if (data.session) await applySession(data.session);
+      })
+      .catch((err) => console.error('Pathway: could not restore the session', err))
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_OUT') {
+        setUserCache(null);
+        setCurrentUserState((prev) => (prev && isRealUserId(prev.id) ? null : prev));
+        return;
+      }
+      if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
+        // Do not call Supabase from inside this callback directly; hand off to the next tick.
+        setTimeout(() => {
+          void applySession(session);
+        }, 0);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      listener.subscription.unsubscribe();
+    };
+  }, [applySession]);
+
   const refreshUser = useCallback(() => {
+    const current = currentUserRef.current;
+
+    if (current && isRealUserId(current.id)) {
+      void (async () => {
+        const { data } = await supabase.auth.getSession();
+        await applySession(data.session);
+      })();
+      return;
+    }
+
+    // Demo personas live in localStorage
     const id = getCurrentUserId();
     if (!id) {
       setCurrentUserState(null);
@@ -58,7 +129,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } else {
       setCurrentUserState(null);
     }
-  }, []);
+  }, [applySession]);
 
   const updateCurrentUser = useCallback((updates: Partial<User>) => {
     if (!currentUser) return;
@@ -69,6 +140,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [currentUser]);
 
   const logout = useCallback(() => {
+    void supabase.auth.signOut(); // ends the server-side session
+    setUserCache(null);
     setCurrentUserId(null);
     setPublicComputerSession(false);
     setIsPublic(false);
@@ -133,32 +206,61 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isOtp: boolean = false,
     isPublicComp: boolean = false
   ) => {
-    const res = loginUser(identifier, password, isOtp);
-    if (res.success && res.user) {
-      setCurrentUserId(res.user.id);
-      setCurrentUserState(res.user);
-      setIsPublic(isPublicComp);
-      setPublicComputerSession(isPublicComp);
-      return { success: true };
+    if (isOtp) {
+      return {
+        success: false,
+        error: 'Login with a one-time code is not connected yet. Please log in with your password.'
+      };
     }
-    return {
-      success: false,
-      error: res.error,
-      isLocked: res.isLocked,
-      lockMinutes: res.lockMinutesRemaining
-    };
+
+    const res = await signInWithPassword(identifier, password || '');
+    if (!res.ok) {
+      return {
+        success: false,
+        error: res.error,
+        isLocked: res.isLocked,
+        lockMinutes: res.isLocked ? 1 : undefined
+      };
+    }
+
+    const loaded = await applySession(res.session);
+    if (!loaded) {
+      return {
+        success: false,
+        error: 'You are signed in, but your profile could not be loaded. Please try again.'
+      };
+    }
+
+    setIsPublic(isPublicComp);
+    setPublicComputerSession(isPublicComp);
+    return { success: true };
   };
 
-  const register = async (params: Parameters<typeof registerUser>[0]) => {
-    const res = registerUser(params);
-    if (res.success && res.user) {
-      setCurrentUserId(res.user.id);
-      setCurrentUserState(res.user);
-      return { success: true, user: res.user };
+  const register = async (params: RegisterParams) => {
+    const res = await signUpWithPassword(params);
+    if (!res.ok) {
+      return { success: false, error: res.error };
     }
-    return { success: false, error: res.error };
+
+    if (!res.session) {
+      // The Supabase project asks people to confirm their email before first login.
+      return {
+        success: false,
+        error: 'Your account is created. Please confirm your email using the link we sent, then log in.'
+      };
+    }
+
+    const loaded = await applySession(res.session);
+    if (!loaded) {
+      return {
+        success: false,
+        error: 'Your account is created, but your profile could not be loaded. Please log in.'
+      };
+    }
+    return { success: true, user: loaded };
   };
 
+  // Demo personas use the old localStorage data and have no server session.
   const switchDemoUser = (persona: 'guest' | 'free' | 'premium' | 'paused' | 'locked' | 'pending_deletion') => {
     if (persona === 'guest') {
       logout();
@@ -200,6 +302,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     if (targetUser) {
+      setUserCache(null);
       setCurrentUserId(targetUser.id);
       setCurrentUserState({ ...targetUser });
       saveAllUsersData(all);
@@ -212,6 +315,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         currentUser,
         user: currentUser,
         isAuthenticated: !!currentUser,
+        isLoading,
         isPublicComputer: isPublic,
         login,
         logout,
